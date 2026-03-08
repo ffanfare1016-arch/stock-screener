@@ -1,6 +1,6 @@
 import streamlit as st
 
-st.title('書き出し用アプリ')
+st.title('株アプリ')
 st.caption('銘柄に関連する勝率を算出するツールです。')
 
 st.write('**使い方**')
@@ -10,4 +10,5 @@ st.markdown(
     '②個別分析で勝率を出す<br>'
     '</p>',
     unsafe_allow_html=True
+
 )
