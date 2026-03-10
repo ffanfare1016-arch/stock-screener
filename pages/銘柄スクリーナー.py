@@ -169,8 +169,8 @@ with st.sidebar:
     st.caption("選んだ条件をすべて満たした日にのみ買い")
 
     st.markdown("**日経平均の方向**")
-    use_nk_up   = st.checkbox("☀️ 先物が前日比プラス（朝6時時点）",   value=False)
-    use_nk_down = st.checkbox("🌧️ 先物が前日比マイナス（朝6時時点）",   value=False)
+    use_nk_up   = st.checkbox("☀️ 先物が前日日経比プラス（NKD=F）",   value=False)
+    use_nk_down = st.checkbox("🌧️ 先物が前日日経比マイナス（NKD=F）",   value=False)
 
     st.markdown("**RSI**")
     use_rsi       = st.checkbox("📉 RSI がしきい値以下", value=False)
@@ -187,15 +187,32 @@ with st.sidebar:
     bb_sigma  = st.slider("σ（標準偏差）", 1.0, 3.0, 2.0, step=0.5, disabled=not use_bband)
 
     st.markdown("**前日の動き**")
-    use_prev_down = st.checkbox("↩️ 前日に大きく下げた翌日", value=False)
-    prev_drop_pct = st.slider("前日下落幅（%以上）", 1.0, 8.0, 3.0, step=0.5, disabled=not use_prev_down)
+    use_prev_move  = st.checkbox("📊 前日の騰落率で絞り込む", value=False)
+    prev_target = st.radio(
+        "騰落率の対象",
+        ["📈 日経平均（全銘柄で取引日数が統一）", "🔵 各銘柄自身（銘柄ごとに変動）"],
+        disabled=not use_prev_move,
+        horizontal=False,
+        help="日経平均：「昨日日経が-5%下げた翌日」など市場全体の条件\n各銘柄自身：「その銘柄自体が前日大きく下げた翌日」など個別条件",
+    )
+    prev_direction = st.radio(
+        "方向",
+        ["↘️ 下落（逆張り狙い）", "↗️ 上昇（モメンタム確認）"],
+        disabled=not use_prev_move,
+        horizontal=True,
+    )
+    prev_pct = st.slider(
+        "前日騰落幅（絶対値 %以上）",
+        0.5, 8.0, 1.0, step=0.5,
+        disabled=not use_prev_move,
+        help="下落なら「-X%以上の下げ」、上昇なら「+X%以上の上げ」"
+    )
 
     st.markdown("**曜日**")
     use_weekday = st.checkbox("📅 特定の曜日だけ", value=False)
     weekday_map = {"月曜日":0,"火曜日":1,"水曜日":2,"木曜日":3,"金曜日":4}
     selected_weekdays = st.multiselect("曜日を選択", list(weekday_map.keys()),
                                         default=["月曜日"], disabled=not use_weekday)
-
     st.markdown("---")
     st.markdown("### 🏆 ランキング基準")
     rank_by = st.radio("並び順", ["勝率（高い順）", "合計損益（高い順）"], horizontal=True)
@@ -221,14 +238,19 @@ def compute_rsi(series, period=14):
 def build_signal(stk, nk, nkd, params):
     close  = stk["Close"]
     signal = pd.Series(True, index=stk.index)
-    # NKD=F 前日終値（日本時間朝6時確定）vs ^N225 前日終値（15:30確定）
-    nkd_prev = nkd["Close"].reindex(stk.index, method="ffill").shift(1)
-    n225_prev = nk["Close"].reindex(stk.index, method="ffill").shift(1)
+    # 【判定ロジック】
+    #   NKD=F（CME）の日付ラベルはET基準のため、yfinanceの「当日D」終値は
+    #   日本時間では「翌朝（D+1朝）」の先物水準に相当する。
+    #   そのため .shift(1) により「前日D-1」のNKD=F終値を使うことで、
+    #   「当日D朝（買い当日）の先物方向」を正しく参照する。
+    #   比較対象の ^N225 も同じく前日D-1の終値（15:30確定）。
+    nkd_close = nkd["Close"].reindex(stk.index, method="ffill").shift(1)  # 前日NKD=F終値＝当日朝の先物方向
+    n225_prev = nk["Close"].reindex(stk.index, method="ffill").shift(1)   # 前日N225終値（15:30）
 
     if params["use_nk_up"]:
-        signal &= (nkd_prev > n225_prev).fillna(False)
+        signal &= (nkd_close > n225_prev).fillna(False)
     if params["use_nk_down"]:
-        signal &= (nkd_prev < n225_prev).fillna(False)
+        signal &= (nkd_close < n225_prev).fillna(False)
     if params["use_rsi"]:
         signal &= (compute_rsi(close) < params["rsi_threshold"]).fillna(False)
     if params["use_ma_dev"]:
@@ -239,9 +261,16 @@ def build_signal(stk, nk, nkd, params):
         bm  = close.rolling(params["bb_period"]).mean()
         bs  = close.rolling(params["bb_period"]).std()
         signal &= (close < bm - params["bb_sigma"] * bs).fillna(False)
-    if params["use_prev_down"]:
-        pr = close.pct_change() * 100
-        signal &= (pr.shift(1) < -params["prev_drop_pct"]).fillna(False)
+    if params["use_prev_move"]:
+        # 日経平均 or 各銘柄自身、どちらの騰落率を使うか切り替え
+        if params["prev_target"].startswith("📈"):
+            pr = nk["Close"].reindex(stk.index, method="ffill").pct_change() * 100  # 日経平均
+        else:
+            pr = close.pct_change() * 100  # 各銘柄自身
+        if params["prev_direction"].startswith("↘️"):
+            signal &= (pr.shift(1) < -params["prev_pct"]).fillna(False)
+        else:
+            signal &= (pr.shift(1) > params["prev_pct"]).fillna(False)
     if params["use_weekday"] and params["selected_weekdays"]:
         dnums = [params["weekday_map"][w] for w in params["selected_weekdays"]]
         signal &= pd.Series(stk.index.dayofweek.isin(dnums), index=stk.index)
@@ -303,7 +332,8 @@ if run_btn:
         use_rsi=use_rsi, rsi_threshold=rsi_threshold,
         use_ma_dev=use_ma_dev, ma_period=ma_period, ma_dev_pct=ma_dev_pct,
         use_bband=use_bband, bb_period=bb_period, bb_sigma=bb_sigma,
-        use_prev_down=use_prev_down, prev_drop_pct=prev_drop_pct,
+        use_prev_move=use_prev_move, prev_target=prev_target,
+        prev_direction=prev_direction, prev_pct=prev_pct,
         use_weekday=use_weekday, selected_weekdays=selected_weekdays,
         weekday_map=weekday_map,
     )
@@ -311,18 +341,21 @@ if run_btn:
     if use_nk_up and use_nk_down:
         st.error("「先物プラス」と「先物マイナス」は同時に選べません"); st.stop()
 
-    any_cond = any([use_nk_up, use_nk_down, use_rsi, use_ma_dev, use_bband, use_prev_down, use_weekday])
+    any_cond = any([use_nk_up, use_nk_down, use_rsi, use_ma_dev, use_bband, use_prev_move, use_weekday])
     if not any_cond:
         st.warning("条件を1つ以上選択してください"); st.stop()
 
     # 使用中の条件ラベル
     cond_labels = []
-    if use_nk_up:   cond_labels.append("☀️ 先物が前日比プラス（朝6時時点）")
-    if use_nk_down: cond_labels.append("🌧️ 先物が前日比マイナス（朝6時時点）")
+    if use_nk_up:   cond_labels.append("☀️ 先物が前日日経比プラス（NKD=F）")
+    if use_nk_down: cond_labels.append("🌧️ 先物が前日日経比マイナス（NKD=F）")
     if use_rsi:     cond_labels.append(f"📉 RSI {rsi_threshold}以下")
     if use_ma_dev:  cond_labels.append(f"📊 {ma_period}日MA から {ma_dev_pct}%以上下落")
     if use_bband:   cond_labels.append(f"🎯 ボリンジャー -{bb_sigma}σ 下抜け")
-    if use_prev_down: cond_labels.append(f"↩️ 前日 -{prev_drop_pct}%以上下落の翌日")
+    if use_prev_move:
+        target_label = "日経平均" if prev_target.startswith("📈") else "銘柄自身"
+        if prev_direction.startswith("↘️"): cond_labels.append(f"↘️ 前日{target_label} -{prev_pct}%以上下落の翌日")
+        else: cond_labels.append(f"↗️ 前日{target_label} +{prev_pct}%以上上昇の翌日")
     if use_weekday and selected_weekdays: cond_labels.append(f"📅 {'・'.join(selected_weekdays)}")
 
     tags = "".join([f'<span class="condition-tag">{c}</span>' for c in cond_labels])
