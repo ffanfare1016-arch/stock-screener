@@ -135,8 +135,11 @@ section[data-testid="stSidebar"] { background: #fff !important; border-right: 1p
 </style>
 """, unsafe_allow_html=True)
 
+from datetime import timezone, timedelta as _td
+_JST = timezone(_td(hours=9))
+
 WEEKDAY_JP  = ["月", "火", "水", "木", "金", "土", "日"]
-today_dt    = datetime.today()
+today_dt    = datetime.now(_JST)
 today_wd    = today_dt.weekday()
 today_label = today_dt.strftime(f"%Y年%m月%d日（{WEEKDAY_JP[today_wd]}曜日）")
 
@@ -168,6 +171,16 @@ def fetch_nikkei():
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.index = pd.to_datetime(df.index).tz_localize(None)
+
+        # ── 月曜朝など、当日の未確定・空行を除外 ──────────────
+        # yfinance が当日分の未確定行（Close=NaN or 0、Volume=0）を
+        # 末尾に返す場合があるため、確定済みデータのみ残す
+        df = df[df.index.normalize() <= pd.Timestamp(datetime.today().date())]
+        df = df.dropna(subset=["Close"])      # Close が NaN の行を除去
+        df = df[df["Close"] > 0]             # Close が 0 の行を除去
+        # ※ ^N225 はインデックス（指数）のため Volume が常に 0
+        #    Volume フィルタをかけると有効な行まで消えてしまうため使わない
+
         return df
 
     nk  = flat(nk_raw.copy())  if not nk_raw.empty  else pd.DataFrame()
@@ -218,9 +231,12 @@ if not data_ok:
 
 # ─── 各指標の計算 ─────────────────────────────────────────────
 
-# ① 先物 vs N225前日終値
+# ① 先物 vs N225直近終値
+# NKD=F の iloc[-1] は「昨日のCMEセッション終値」＝「今朝の先物水準」
+# 比較対象は last_nk（昨日のN225終値）が正しい。
+# prev_nk（一昨日のN225終値）と比べると1日ズレるため修正。
 nkd_latest = float(nkd["Close"].iloc[-1]) if not nkd.empty else None
-nk_prev    = prev_nk  # N225の前日終値
+nk_prev    = last_nk  # N225の直近終値（昨日15:30）と比較
 
 if nkd_latest and nk_prev:
     fut_diff = nkd_latest - nk_prev
@@ -246,9 +262,11 @@ else:
     ma_dev = None; ma_hit = False
 
 # ④ 前日（昨日）の日経下落幅
-if len(nk) >= 3:
-    c_yday    = float(nk["Close"].iloc[-2])
-    c_2day    = float(nk["Close"].iloc[-3])
+# last_nk = iloc[-1]（昨日終値）、prev_nk = iloc[-2]（一昨日終値）を使う
+# iloc[-2]/-3]を使うと1日古いデータ（月曜→先週金曜）になるため修正
+if len(nk) >= 2 and last_nk and prev_nk:
+    c_yday    = last_nk   # 昨日終値
+    c_2day    = prev_nk   # 一昨日終値
     prev_drop = (c_yday - c_2day) / c_2day * 100
     prev_hit  = prev_drop < -prev_drop_th
 else:
@@ -299,7 +317,7 @@ with col1:
                 <span class="badge {badge_cls}">{direction}</span>
             </div>
             <div class="ind-value {color}">{sign}{fut_pct:.2f}%</div>
-            <div class="ind-meta">先物（NKD=F）: <b>{nkd_latest:,.0f}</b>　／　N225前日終値: <b>{nk_prev:,.0f}</b></div>
+            <div class="ind-meta">先物（NKD=F）: <b>{nkd_latest:,.0f}</b>　／　N225直近終値: <b>{nk_prev:,.0f}</b></div>
             <span class="ind-threshold">差分 {sign}{fut_diff:,.0f} 円</span>
         </div>
         """, unsafe_allow_html=True)
